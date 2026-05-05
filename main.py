@@ -1,9 +1,7 @@
 import os
 import hmac
-import hashlib
 import logging
 import shutil
-import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -37,6 +35,7 @@ TABLES_BY_CATEGORY = {
     "protocol": ["dim_protocol_entry", "fact_protocol_step"],
     "experiment": ["dim_experiment", "fact_experiment_run", "fact_measurement_long"],
 }
+
 
 # ---------- generic helpers ----------
 
@@ -94,10 +93,29 @@ def normalize_text(x: Any) -> Optional[str]:
     return s or None
 
 
+def clean_value(v: Any):
+    # Handles NaN / NaT / pandas timestamps so JSON sent to Supabase is valid
+    if pd.isna(v):
+        return None
+    if isinstance(v, pd.Timestamp):
+        return v.isoformat()
+    return v
+
+
+def dataframe_to_records(df: pd.DataFrame):
+    records = []
+    for _, row in df.iterrows():
+        rec = {}
+        for col in df.columns:
+            rec[col] = clean_value(row[col])
+        records.append(rec)
+    return records
+
+
 def upsert_df(table_name: str, df: pd.DataFrame, on_col: str):
     if df.empty:
         return 0
-    records = df.where(pd.notnull(df), None).to_dict(orient="records")
+    records = dataframe_to_records(df)
     supabase.table(table_name).upsert(records, on_conflict=on_col).execute()
     return len(records)
 
@@ -105,19 +123,12 @@ def upsert_df(table_name: str, df: pd.DataFrame, on_col: str):
 def replace_table(table_name: str, df: pd.DataFrame):
     """
     Insert the provided dataframe into an already-reset table.
-
-    Important:
-    We do NOT try to delete rows here anymore, because the Silver tables
-    do not all share a generic 'id' column. Table clearing is now handled
-    category-by-category through dedicated Postgres RPC functions:
-      - reset_donor_tables()
-      - reset_protocol_tables()
-      - reset_experiment_tables()
+    Table clearing is handled category-by-category via dedicated RPC functions.
     """
     if df.empty:
         return 0
 
-    records = df.where(pd.notnull(df), None).to_dict(orient="records")
+    records = dataframe_to_records(df)
     batch = 500
     for i in range(0, len(records), batch):
         supabase.table(table_name).insert(records[i:i+batch]).execute()
@@ -125,10 +136,6 @@ def replace_table(table_name: str, df: pd.DataFrame):
 
 
 def reset_category_tables(category: str):
-    """
-    Clear only the Silver tables that belong to the refreshed category.
-    The matching SQL RPC functions must already exist in Supabase.
-    """
     if category == "donor":
         supabase.rpc("reset_donor_tables").execute()
     elif category == "protocol":
@@ -145,6 +152,7 @@ def log_sync(status: str, category: str, message: str):
         supabase.table("sync_logs").insert(payload).execute()
     except Exception as e:
         logger.warning("Could not write sync_logs: %s", e)
+
 
 # ---------- donor parsing ----------
 
@@ -202,6 +210,7 @@ def parse_donor_files(root: Path):
         }
         rows.append(row)
     return pd.DataFrame(rows)
+
 
 # ---------- protocol parsing ----------
 
@@ -265,6 +274,7 @@ def parse_protocol_files(root: Path):
         flush_step(current_num, current_buf)
 
     return pd.DataFrame(dim_rows), pd.DataFrame(fact_rows)
+
 
 # ---------- experiment parsing ----------
 REQUIRED_MEASUREMENT_MAP = {
@@ -438,6 +448,7 @@ def parse_experiment_files(root: Path):
         pd.DataFrame(meas_rows),
     )
 
+
 # ---------- orchestration ----------
 
 def refresh_category(category: str):
@@ -451,7 +462,6 @@ def refresh_category(category: str):
     except Exception:
         pass
 
-    # Reset the relevant Silver tables first, then reinsert the refreshed snapshot.
     reset_category_tables(category)
 
     if category == "donor":
