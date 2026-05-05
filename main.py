@@ -30,14 +30,6 @@ FOLDER_TO_CATEGORY = {
     "experiment_excel": "experiment",
 }
 
-TABLES_BY_CATEGORY = {
-    "donor": ["dim_donor_sample"],
-    "protocol": ["dim_protocol_entry", "fact_protocol_step"],
-    "experiment": ["dim_experiment", "fact_experiment_run", "fact_measurement_long"],
-}
-
-
-# ---------- generic helpers ----------
 
 def verify_secret(received: Optional[str]):
     if not WEBHOOK_SECRET:
@@ -94,7 +86,6 @@ def normalize_text(x: Any) -> Optional[str]:
 
 
 def clean_value(v: Any):
-    # Handles NaN / NaT / pandas timestamps so JSON sent to Supabase is valid
     if pd.isna(v):
         return None
     if isinstance(v, pd.Timestamp):
@@ -112,19 +103,7 @@ def dataframe_to_records(df: pd.DataFrame):
     return records
 
 
-def upsert_df(table_name: str, df: pd.DataFrame, on_col: str):
-    if df.empty:
-        return 0
-    records = dataframe_to_records(df)
-    supabase.table(table_name).upsert(records, on_conflict=on_col).execute()
-    return len(records)
-
-
 def replace_table(table_name: str, df: pd.DataFrame):
-    """
-    Insert the provided dataframe into an already-reset table.
-    Table clearing is handled category-by-category via dedicated RPC functions.
-    """
     if df.empty:
         return 0
 
@@ -156,12 +135,6 @@ def log_sync(status: str, category: str, message: str):
 
 # ---------- donor parsing ----------
 
-def extract_value(text: str, label: str) -> Optional[str]:
-    import re
-    m = re.search(rf"{re.escape(label)}\s*:?\s*(.+)", text, flags=re.I)
-    return m.group(1).strip() if m else None
-
-
 def parse_datetime(value: Optional[str]):
     if not value:
         return None
@@ -171,44 +144,127 @@ def parse_datetime(value: Optional[str]):
         return None
 
 
-def parse_donor_files(root: Path):
-    import pdfplumber
-
-    catalog = load_catalog_map(root)
-    rows = []
-    for pdf_path in sorted((root / "bronze" / "donor_pdf").glob("*.pdf")):
+def extract_pdf_text(pdf_path: Path) -> str:
+    text = ""
+    try:
+        import pdfplumber
         with pdfplumber.open(str(pdf_path)) as pdf:
             text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+    except Exception:
+        text = ""
+
+    # Fallback to PyMuPDF if pdfplumber text is too poor
+    if len(text.strip()) < 50:
+        try:
+            import fitz
+            doc = fitz.open(str(pdf_path))
+            text = "\n".join(page.get_text() for page in doc)
+        except Exception:
+            pass
+    return text
+
+
+def parse_label_lines(text: str) -> Dict[str, str]:
+    """
+    More robust than regex searching.
+    It parses one label-value pair per line and also supports a continuation line,
+    e.g.:
+        Sample is still refrigerated
+        upon arrival:
+        YES
+    """
+    raw_lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    fields: Dict[str, str] = {}
+    i = 0
+    while i < len(raw_lines):
+        line = raw_lines[i]
+
+        # Special join for the known refrigerated label split across lines
+        if (
+            i + 2 < len(raw_lines)
+            and line.lower() == "sample is still refrigerated"
+            and raw_lines[i + 1].lower().startswith("upon arrival")
+        ):
+            label = "Sample is still refrigerated upon arrival"
+            value = raw_lines[i + 2].strip()
+            fields[label] = value
+            i += 3
+            continue
+
+        if ":" in line:
+            label, value = line.split(":", 1)
+            label = label.strip()
+            value = value.strip()
+            # If line ends with colon and next line is the value, grab it
+            if value == "" and i + 1 < len(raw_lines) and ":" not in raw_lines[i + 1]:
+                value = raw_lines[i + 1].strip()
+                i += 1
+            fields[label] = value
+
+        i += 1
+    return fields
+
+
+def get_field(fields: Dict[str, str], *candidates: str) -> Optional[str]:
+    for key in candidates:
+        if key in fields and str(fields[key]).strip():
+            return fields[key].strip()
+    return None
+
+
+def parse_donor_files(root: Path):
+    catalog = load_catalog_map(root)
+    rows = []
+
+    for pdf_path in sorted((root / "bronze" / "donor_pdf").glob("*.pdf")):
+        text = extract_pdf_text(pdf_path)
+        fields = parse_label_lines(text)
+
+        # First line usually looks like "MR-RB-S70 | patient samples"
+        first_nonempty = next((ln.strip() for ln in text.splitlines() if ln.strip()), pdf_path.stem)
+        sample_name = first_nonempty.split("|", 1)[0].strip() if "|" in first_nonempty else pdf_path.stem
+
+        sample_sysid = normalize_text(get_field(fields, "Sysid"))
+        # Very defensive fallback so a single poorly parsed PDF does not crash the whole refresh
+        if not sample_sysid:
+            sample_sysid = f"UNPARSED_{pdf_path.stem}"
+
         row = {
-            "sample_sysid": normalize_text(extract_value(text, "Sysid")),
-            "sample_name": normalize_text(text.split("|", 1)[0].strip() if "|" in text else pdf_path.stem),
-            "owner_name": normalize_text(extract_value(text, "Owner")),
-            "source": normalize_text(extract_value(text, "Source")),
-            "created_at": parse_datetime(extract_value(text, "Created at")),
-            "collection_datetime": parse_datetime(extract_value(text, "Date and time of collection")),
-            "sample_type": normalize_text(extract_value(text, "Type of sample")),
-            "number_of_children_raw": normalize_text(extract_value(text, "Number of children")),
-            "donor_age_years": pd.to_numeric(extract_value(text, "Age"), errors="coerce"),
-            "sample_size_g": normalize_text(extract_value(text, "Sample Size")),
-            "serology_raw": normalize_text(extract_value(text, "Serology")),
-            "current_medication_raw": normalize_text(extract_value(text, "Current Medication")),
-            "pathology_raw": normalize_text(extract_value(text, "Mammary Gland Pathology")),
-            "consent_flag": normalize_text(extract_value(text, "Consent")),
-            "received_by": normalize_text(extract_value(text, "Received by")),
-            "sample_sheet_flag": normalize_text(extract_value(text, "Sample sheet")),
-            "transport_sheet_flag": normalize_text(extract_value(text, "Transport sheet")),
-            "pickup_datetime": parse_datetime(extract_value(text, "Pick up time by transporter")),
+            "sample_sysid": sample_sysid,
+            "sample_name": normalize_text(sample_name),
+            "owner_name": normalize_text(get_field(fields, "Owner")),
+            "source": normalize_text(get_field(fields, "Source")),
+            "created_at": parse_datetime(get_field(fields, "Created at")),
+            "collection_datetime": parse_datetime(get_field(fields, "Date and time of collection")),
+            "sample_type": normalize_text(get_field(fields, "Type of sample")),
+            "number_of_children_raw": normalize_text(get_field(fields, "Number of children")),
+            "donor_age_years": pd.to_numeric(get_field(fields, "Age"), errors="coerce"),
+            "sample_size_g": normalize_text(get_field(fields, "Sample Size")),
+            "serology_raw": normalize_text(get_field(fields, "Serology")),
+            "current_medication_raw": normalize_text(get_field(fields, "Current Medication")),
+            "pathology_raw": normalize_text(get_field(fields, "Mammary Gland Pathology")),
+            "consent_flag": normalize_text(get_field(fields, "Consent")),
+            "received_by": normalize_text(get_field(fields, "Received by")),
+            "sample_sheet_flag": normalize_text(get_field(fields, "Sample sheet")),
+            "transport_sheet_flag": normalize_text(get_field(fields, "Transport sheet")),
+            "pickup_datetime": parse_datetime(get_field(fields, "Pick up time by transporter")),
             "dropoff_datetime": parse_datetime(
-                extract_value(text, "Drop off time by transporter")
-                or extract_value(text, "Drop o6 time by transporter")
-                or extract_value(text, "Drop o7 time by transporter")
+                get_field(
+                    fields,
+                    "Drop off time by transporter",
+                    "Drop o6 time by transporter",
+                    "Drop o7 time by transporter",
+                )
             ),
-            "refrigerated_on_arrival_flag": normalize_text(extract_value(text, "Sample is still refrigerated upon arrival")),
-            "origin_of_sample": normalize_text(extract_value(text, "Origin of the sample")),
+            "refrigerated_on_arrival_flag": normalize_text(
+                get_field(fields, "Sample is still refrigerated upon arrival")
+            ),
+            "origin_of_sample": normalize_text(get_field(fields, "Origin of the sample")),
             "source_file_name": pdf_path.name,
             "source_file_id": catalog.get(pdf_path.name),
         }
         rows.append(row)
+
     return pd.DataFrame(rows)
 
 
@@ -227,6 +283,10 @@ def parse_protocol_files(root: Path):
         title_line = next((line.strip() for line in text.splitlines() if line.strip()), pdf_path.stem)
         m = re.search(r"\bID\s*:\s*(\d+)\b", text)
         entry_id = m.group(1) if m else pdf_path.stem
+
+        def extract_value(text: str, label: str) -> Optional[str]:
+            m2 = re.search(rf"{re.escape(label)}\s*:?\s*(.+)", text, flags=re.I)
+            return m2.group(1).strip() if m2 else None
 
         project = normalize_text(extract_value(text, "Project"))
         folder = normalize_text(extract_value(text, "Folder"))
@@ -449,8 +509,6 @@ def parse_experiment_files(root: Path):
     )
 
 
-# ---------- orchestration ----------
-
 def refresh_category(category: str):
     root = WORKDIR_ROOT
     if root.exists():
@@ -476,11 +534,7 @@ def refresh_category(category: str):
         dim_df, fact_df = parse_protocol_files(root)
         replace_table("dim_protocol_entry", dim_df)
         replace_table("fact_protocol_step", fact_df)
-        log_sync(
-            "success",
-            category,
-            f"Refreshed protocol tables: {len(dim_df)} entry rows, {len(fact_df)} step rows",
-        )
+        log_sync("success", category, f"Refreshed protocol tables: {len(dim_df)} entry rows, {len(fact_df)} step rows")
         return {"dim_protocol_entry": len(dim_df), "fact_protocol_step": len(fact_df)}
 
     if category == "experiment":
@@ -489,16 +543,8 @@ def refresh_category(category: str):
         replace_table("dim_experiment", dim_df)
         replace_table("fact_experiment_run", run_df)
         replace_table("fact_measurement_long", meas_df)
-        log_sync(
-            "success",
-            category,
-            f"Refreshed experiment tables: {len(dim_df)}, {len(run_df)}, {len(meas_df)} rows",
-        )
-        return {
-            "dim_experiment": len(dim_df),
-            "fact_experiment_run": len(run_df),
-            "fact_measurement_long": len(meas_df),
-        }
+        log_sync("success", category, f"Refreshed experiment tables: {len(dim_df)}, {len(run_df)}, {len(meas_df)} rows")
+        return {"dim_experiment": len(dim_df), "fact_experiment_run": len(run_df), "fact_measurement_long": len(meas_df)}
 
     raise ValueError(f"Unknown category: {category}")
 
