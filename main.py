@@ -98,20 +98,45 @@ def upsert_df(table_name: str, df: pd.DataFrame, on_col: str):
     if df.empty:
         return 0
     records = df.where(pd.notnull(df), None).to_dict(orient="records")
-    # PostgREST upsert
     supabase.table(table_name).upsert(records, on_conflict=on_col).execute()
     return len(records)
 
 
 def replace_table(table_name: str, df: pd.DataFrame):
-    supabase.table(table_name).delete().neq("id", -1).execute()
+    """
+    Insert the provided dataframe into an already-reset table.
+
+    Important:
+    We do NOT try to delete rows here anymore, because the Silver tables
+    do not all share a generic 'id' column. Table clearing is now handled
+    category-by-category through dedicated Postgres RPC functions:
+      - reset_donor_tables()
+      - reset_protocol_tables()
+      - reset_experiment_tables()
+    """
     if df.empty:
         return 0
+
     records = df.where(pd.notnull(df), None).to_dict(orient="records")
     batch = 500
     for i in range(0, len(records), batch):
         supabase.table(table_name).insert(records[i:i+batch]).execute()
     return len(records)
+
+
+def reset_category_tables(category: str):
+    """
+    Clear only the Silver tables that belong to the refreshed category.
+    The matching SQL RPC functions must already exist in Supabase.
+    """
+    if category == "donor":
+        supabase.rpc("reset_donor_tables").execute()
+    elif category == "protocol":
+        supabase.rpc("reset_protocol_tables").execute()
+    elif category == "experiment":
+        supabase.rpc("reset_experiment_tables").execute()
+    else:
+        raise ValueError(f"Unknown category: {category}")
 
 
 def log_sync(status: str, category: str, message: str):
@@ -165,7 +190,11 @@ def parse_donor_files(root: Path):
             "sample_sheet_flag": normalize_text(extract_value(text, "Sample sheet")),
             "transport_sheet_flag": normalize_text(extract_value(text, "Transport sheet")),
             "pickup_datetime": parse_datetime(extract_value(text, "Pick up time by transporter")),
-            "dropoff_datetime": parse_datetime(extract_value(text, "Drop off time by transporter") or extract_value(text, "Drop o6 time by transporter") or extract_value(text, "Drop o7 time by transporter")),
+            "dropoff_datetime": parse_datetime(
+                extract_value(text, "Drop off time by transporter")
+                or extract_value(text, "Drop o6 time by transporter")
+                or extract_value(text, "Drop o7 time by transporter")
+            ),
             "refrigerated_on_arrival_flag": normalize_text(extract_value(text, "Sample is still refrigerated upon arrival")),
             "origin_of_sample": normalize_text(extract_value(text, "Origin of the sample")),
             "source_file_name": pdf_path.name,
@@ -187,15 +216,13 @@ def parse_protocol_files(root: Path):
         doc = fitz.open(str(pdf_path))
         text = "\n".join(page.get_text() for page in doc)
         title_line = next((line.strip() for line in text.splitlines() if line.strip()), pdf_path.stem)
-        entry_id = None
         m = re.search(r"\bID\s*:\s*(\d+)\b", text)
-        if m:
-            entry_id = m.group(1)
-        else:
-            entry_id = pdf_path.stem
+        entry_id = m.group(1) if m else pdf_path.stem
+
         project = normalize_text(extract_value(text, "Project"))
         folder = normalize_text(extract_value(text, "Folder"))
         owner = normalize_text(extract_value(text, "Owner"))
+
         dim_rows.append({
             "protocol_entry_id": entry_id,
             "title": title_line,
@@ -205,10 +232,11 @@ def parse_protocol_files(root: Path):
             "source_file_name": pdf_path.name,
             "source_file_id": catalog.get(pdf_path.name),
         })
-        # very simple step extraction based on standalone step numbers
+
         lines = [ln.rstrip() for ln in text.splitlines()]
         current_num = None
         current_buf = []
+
         def flush_step(num, buf):
             nonlocal step_id
             if num is None:
@@ -226,6 +254,7 @@ def parse_protocol_files(root: Path):
                 "source_file_id": catalog.get(pdf_path.name),
             })
             step_id += 1
+
         for ln in lines:
             if re.fullmatch(r"\d+", ln.strip()):
                 flush_step(current_num, current_buf)
@@ -234,6 +263,7 @@ def parse_protocol_files(root: Path):
             else:
                 current_buf.append(ln)
         flush_step(current_num, current_buf)
+
     return pd.DataFrame(dim_rows), pd.DataFrame(fact_rows)
 
 # ---------- experiment parsing ----------
@@ -402,7 +432,11 @@ def parse_experiment_files(root: Path):
                     "source_row_number": idx + 2,
                 })
                 measurement_counter += 1
-    return pd.DataFrame(dim_rows).drop_duplicates(), pd.DataFrame(run_rows).drop_duplicates(), pd.DataFrame(meas_rows)
+    return (
+        pd.DataFrame(dim_rows).drop_duplicates(),
+        pd.DataFrame(run_rows).drop_duplicates(),
+        pd.DataFrame(meas_rows),
+    )
 
 # ---------- orchestration ----------
 
@@ -412,11 +446,13 @@ def refresh_category(category: str):
         shutil.rmtree(root)
     ensure_dirs(root)
 
-    # metadata catalog optional
     try:
         download_folder("metadata_bronze", root / "metadata_bronze")
     except Exception:
         pass
+
+    # Reset the relevant Silver tables first, then reinsert the refreshed snapshot.
+    reset_category_tables(category)
 
     if category == "donor":
         download_folder("donor_pdf", root / "bronze" / "donor_pdf")
@@ -430,7 +466,11 @@ def refresh_category(category: str):
         dim_df, fact_df = parse_protocol_files(root)
         replace_table("dim_protocol_entry", dim_df)
         replace_table("fact_protocol_step", fact_df)
-        log_sync("success", category, f"Refreshed protocol tables: {len(dim_df)} entry rows, {len(fact_df)} step rows")
+        log_sync(
+            "success",
+            category,
+            f"Refreshed protocol tables: {len(dim_df)} entry rows, {len(fact_df)} step rows",
+        )
         return {"dim_protocol_entry": len(dim_df), "fact_protocol_step": len(fact_df)}
 
     if category == "experiment":
@@ -439,8 +479,16 @@ def refresh_category(category: str):
         replace_table("dim_experiment", dim_df)
         replace_table("fact_experiment_run", run_df)
         replace_table("fact_measurement_long", meas_df)
-        log_sync("success", category, f"Refreshed experiment tables: {len(dim_df)}, {len(run_df)}, {len(meas_df)} rows")
-        return {"dim_experiment": len(dim_df), "fact_experiment_run": len(run_df), "fact_measurement_long": len(meas_df)}
+        log_sync(
+            "success",
+            category,
+            f"Refreshed experiment tables: {len(dim_df)}, {len(run_df)}, {len(meas_df)} rows",
+        )
+        return {
+            "dim_experiment": len(dim_df),
+            "fact_experiment_run": len(run_df),
+            "fact_measurement_long": len(meas_df),
+        }
 
     raise ValueError(f"Unknown category: {category}")
 
