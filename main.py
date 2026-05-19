@@ -241,6 +241,14 @@ def first_match(text: str, patterns: List[str], flags: int = re.I | re.S) -> Opt
             return re.sub(r"\s+", " ", value).strip()
     return None
 
+def infer_cell_line_id(sample_name: Optional[str], source_file_name: Optional[str]) -> Optional[str]:
+    for text in [sample_name, source_file_name]:
+        if not text:
+            continue
+        m = re.search(r"(S\d+)", str(text), flags=re.I)
+        if m:
+            return m.group(1).upper()
+    return None
 
 def parse_datetime(value: Optional[str]):
     if not value:
@@ -262,6 +270,7 @@ def parse_donor_pdf(pdf_path: Path, file_id_map: Dict[str, str]) -> Tuple[dict, 
     row = {
         "sample_sysid": find([r"Sysid:\s*(PS-\d{2}\.\d{4})"]),
         "sample_name": sample_name,
+        "cell_line_id": infer_cell_line_id(sample_name, pdf_path.name),
         "owner_name": find([r"Owner:\s*(.+?)\n(?:Source:|Created at:|Date and time of collection:)"]),
         "source_site_raw": find([r"Source:\s*(.+?)\n(?:Created at:|Date and time of collection:)"]) or "Unknown",
         "created_at": parse_datetime(find([r"Created at:\s*([0-9]{4}-[0-9]{2}-[0-9]{2})"])),
