@@ -844,8 +844,10 @@ def parse_single_experiment_file(file_path: Path, file_id_map: Dict[str, str], m
             continue
 
         run_info = run_lookup.get(raw_run_label, {})
-        run_id = run_info.get("run_id")
-        cell_line_id = run_info.get("cell_line_id")
+        run_id = run_info.get("run_id") if isinstance(run_info, dict) else run_info
+        cell_line_id = run_info.get("cell_line_id") if isinstance(run_info, dict) else None
+
+        print("DEBUG:", raw_run_label, run_info, run_id, cell_line_id)
         measurement_date = (
             row["DateID"].date().isoformat()
             if ("DateID" in df.columns and pd.notna(row["DateID"]))
