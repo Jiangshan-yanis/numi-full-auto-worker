@@ -828,7 +828,10 @@ def parse_single_experiment_file(file_path: Path, file_id_map: Dict[str, str], m
             "file_format": file_path.suffix.lower().lstrip("."),
         }
         run_records.append(run_row)
-        run_lookup[parsed["normalized_raw_run_label"]] = parsed["run_id"]
+        run_lookup[parsed["normalized_raw_run_label"]] = {
+            "run_id": parsed["run_id"],
+            "cell_line_id": parsed["cell_line_id"],
+         }
 
     run_df = pd.DataFrame(run_records)
 
@@ -840,7 +843,9 @@ def parse_single_experiment_file(file_path: Path, file_id_map: Dict[str, str], m
         if raw_run_label == "":
             continue
 
-        run_id = run_lookup.get(raw_run_label)
+        run_info = run_lookup.get(raw_run_label, {})
+        run_id = run_info.get("run_id")
+        cell_line_id = run_info.get("cell_line_id")
         measurement_date = (
             row["DateID"].date().isoformat()
             if ("DateID" in df.columns and pd.notna(row["DateID"]))
@@ -856,6 +861,7 @@ def parse_single_experiment_file(file_path: Path, file_id_map: Dict[str, str], m
             measurement_records.append({
                 "measurement_id": f"M{measurement_counter:06d}",
                 "run_id": run_id,
+                "cell_line_id": cell_line_id,
                 "experiment_id": meta["experiment_id"],
                 "measurement_date": measurement_date,
                 "culture_day": culture_day,
@@ -882,6 +888,7 @@ def parse_single_experiment_file(file_path: Path, file_id_map: Dict[str, str], m
             measurement_records.append({
                 "measurement_id": f"M{measurement_counter:06d}",
                 "run_id": run_id,
+                "cell_line_id": cell_line_id,
                 "experiment_id": meta["experiment_id"],
                 "measurement_date": measurement_date,
                 "culture_day": culture_day,
